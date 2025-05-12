@@ -1,0 +1,11 @@
+pandas
+ta
+yfinance
+matplotlib
+numpy
+alpaca-trade-api
+transformers
+newsapi-python
+torch
+torchvision
+torchaudio
