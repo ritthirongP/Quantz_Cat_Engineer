@@ -1,3 +1,17 @@
+#  red zone 
+# import six
+# import sys
+# import types
+
+# # Fake the deprecated path for backward compatibility
+# urllib3_six = types.SimpleNamespace(moves=six.moves)
+# sys.modules['urllib3.packages.six.moves'] = six.moves
+# sys.modules['urllib3.packages.six'] = urllib3_six
+
+
+
+
+
 import pandas as pd
 import ta
 import yfinance as yf
@@ -6,6 +20,7 @@ import numpy as np
 import alpaca_trade_api as tradeapi
 from transformers import pipeline
 from newsapi import NewsApiClient
+# import signal_strategy_backtest_bt as bt
 
 NUMBER_OF_STOCK = 5
 TICKET_LIST = []
@@ -23,10 +38,18 @@ newsapi = NewsApiClient(api_key=NEWS_API_KEY)
 # Initialize sentiment analysis
 sentiment_pipeline = pipeline("sentiment-analysis")
 
-def get_news_for_stock(symbol):
-    query = f"{symbol} stock"
-    articles = newsapi.get_everything(q=query, language='en', sort_by='publishedAt', page_size=5)
-    return [article['title'] + ". " + article['description'] for article in articles['articles']]
+def get_news_for_stock(symbol, date):
+    from_dt = date.strftime("%Y-%m-%dT00:00:00")
+    to_dt = date.strftime("%Y-%m-%dT23:59:59")
+    articles = newsapi.get_everything(
+        q=f"{symbol} stock",
+        language='en',
+        from_param=from_dt,
+        to=to_dt,
+        sort_by='relevancy',
+        page_size=5,
+    )
+    return [a["title"] + ". " + (a["description"] or "") for a in articles["articles"]]
 
 def detect_market_trend(df, atr_window=14, ma_window=50, threshold=0.005):
     """
@@ -170,31 +193,43 @@ def backtest_strategy(
     df["Portfolio"] = capital  # Initialize Portfolio Value
     stop_loss_price = None
     take_profit_price = None
+    trades = []  # ✅ New: Store trade history for analysis
     
 
     for index, row in df.iterrows():
-        signal = row["Signal"][0]
-        current_price = row["Close"][0]
-        strength = row["Signal_Strength"][0]
+        # signal = row["Signal"][0]
+        # current_price = row["Close"][0]
+        # strength = row["Signal_Strength"][0]
+        signal = row.get("Signal", 0)
+        current_price = row.get("Close", 0)
+        strength = row.get("Signal_Strength", 0)
+        ema_50  = row.get("EMA_50_raw", 0)
+        ema_200 = row.get("EMA_200_raw", 0)
         print(f"[{index}] Signal: {signal}, Strength: {strength}, Capital: {capital:.2f}, Shares: {shares}")
 
+        if isinstance(signal, (pd.Series, np.ndarray)):
+            signal = signal.item()
+        if isinstance(strength, (pd.Series, np.ndarray)):
+            strength = strength.item()
+        if isinstance(current_price, (pd.Series, np.ndarray)):
+            current_price = current_price.item()
+        if isinstance(ema_50, (pd.Series, np.ndarray)):
+            ema_50 = ema_50.item()
+        if isinstance(ema_200, (pd.Series, np.ndarray)):
+            ema_200 = ema_200.item()
+        
         df.at[index, "Portfolio"] = capital + (shares * current_price)
-
+        
         # Compute ATR for dynamic stop-loss
+        atr = None
         if "ATR" in df.columns:
-            atr = row["ATR"][0]
-            # stop_loss_level = current_price - (2.5 * atr)  # ATR-based stop-loss
-            # take_profit_level = current_price + (3 * atr)
-        # else:
-        #     stop_loss_level = current_price * (
-        #         1 - stop_loss_pct / 100
-        #     )  # Fixed stop-loss
-        #     take_profit_level = current_price * (
-        #         1 + stop_loss_pct / 100
-        #     )
-
+            atr = row.get("ATR", 0)
+            if isinstance(atr, (pd.Series, np.ndarray)):
+                atr = atr.item()
+        if pd.isna(atr) or atr == 0:
+            continue 
+        print('a')
         if shares > 0:
-
             if stop_loss_price and current_price <= stop_loss_price:
                 capital += shares * current_price
                 print(f"[STOP LOSS] {index} sell at {current_price:.2f}")
@@ -202,6 +237,7 @@ def backtest_strategy(
                 stop_loss_price = None
                 take_profit_price = None
                 df.at[index, "Signal"] = -1
+                trades.append({"date": index, "type": "STOP_LOSS", "price": current_price})
                 continue
             elif take_profit_price and current_price >= take_profit_price:
                 capital += shares * current_price
@@ -210,6 +246,7 @@ def backtest_strategy(
                 stop_loss_price = None
                 take_profit_price = None
                 df.at[index, "Signal"] = -1
+                trades.append({"date": index, "type": "TAKE_PROFIT", "price": current_price})
                 continue
 
 
@@ -220,14 +257,15 @@ def backtest_strategy(
         #     take_profit_price = None
         #     df.at[index, "Signal"] = -1
 
-
+        # print(f'b:{df.columns}')
         if signal == 1 and shares == 0 and abs(strength) >= 0.3:  # Buy
-            if atr == 0 or np.isnan(atr):
+            if pd.isna(atr) or atr == 0:
                 continue
             price = current_price
             stop_loss_distance = 2.5 * atr
             risk_amount = capital * risk_per_trade  # e.g., 2%
-            position_size = int(risk_amount / stop_loss_distance)
+            scaled_risk = risk_amount * abs(strength)
+            position_size = int(scaled_risk / stop_loss_distance)
             total_cost = position_size * price
 
             if total_cost > capital:
@@ -239,24 +277,30 @@ def backtest_strategy(
                 stop_loss_price = price - stop_loss_distance
                 take_profit_price = price + (3 * atr)
                 print(f"[BUY] {index} {shares} shares at {price:.2f}")
-
+                trades.append({"date": index, "type": "BUY", "price": price, "shares": shares, "capital": capital})
+                # ✅ Trend exit if long and trend flips
+        elif shares > 0 and ema_50 < ema_200:
+            capital += shares * current_price
+            trades.append({"date": index, "type": "TREND_EXIT", "price": current_price, "shares": shares})
+            shares = 0
+            stop_loss_price = None
+            take_profit_price = None
         if signal == -1 and shares > 0:  # Sell
             capital += shares * current_price  # Sell all shares
             print(f"[SELL] {index} {shares} shares at {price:.2f}")
+            trades.append({"date": index, "type": "SELL", "price": current_price, "shares": shares})
             shares = 0  # Reset share count
             stop_loss_price = None
             take_profit_price = None
-        
         if signal == 1:
             print(f"[BUY] {index} at {current_price:.2f}")
         if signal == -1:
             print(f"[SELL] {index} at {current_price:.2f}")
 
-
         df.at[index, "Portfolio"] = capital + (
             shares * current_price
         )  # Update portfolio value
-
+    pd.DataFrame(trades).to_csv("trades_log.csv", index=False)
     return df
 
 
@@ -316,18 +360,22 @@ def calculate_supertrend(df, multiplier=2):
     df["LowerBand"] = df["hl2"].astype(float) - (df["ATR"].astype(float) * multiplier)
     # Initialize SuperTrend direction
     df["SuperTrend"] = 1  # 1 for bullish, -1 for bearish
-    for i in range(1, len(df)):
-        close_price = df.iloc[i]["Close_raw"].values
-        upper_band = df.iloc[i - 1]["UpperBand"].values
-        lower_band = df.iloc[i - 1]["LowerBand"].values
-        # print(f'{close_price.values}.{upper_band.values}.{lower_band.values}')
+    try:
+        for i in range(1, len(df)):
+            close_price = df.iloc[i]["Close_raw"]
+            upper_band = df.iloc[i - 1]["UpperBand"]
+            lower_band = df.iloc[i - 1]["LowerBand"]
+            # print(f'{close_price.values}.{upper_band.values}.{lower_band.values}')
 
-        if close_price > upper_band:
-            df.at[i, "SuperTrend"] = 1  # Uptrend
-        elif close_price < lower_band:
-            df.at[i, "SuperTrend"] = -1  # Downtrend
-        else:
-            df.at[i, "SuperTrend"] = df.iloc[i - 1]["SuperTrend"]  # Carry forward trend
+            if close_price > upper_band:
+                df.at[i, "SuperTrend"] = 1  # Uptrend
+            elif close_price < lower_band:
+                df.at[i, "SuperTrend"] = -1  # Downtrend
+            else:
+                df.at[i, "SuperTrend"] = df.iloc[i - 1]["SuperTrend"]  # Carry forward trend
+    except Exception as e:
+        error_msg = str(e)
+        print(error_msg)
 
     return df["SuperTrend"],df
 
@@ -555,22 +603,19 @@ def signal_strength(df,symbol,mode="back_test"):
 
 
         # Get latest sentiment
-        if(mode != "back_test"):
+        if mode != "back_test":
             try:
-                headlines = get_news_for_stock(symbol)
-                sentiment_score = get_sentiment_score(headlines)  # Range: -1 to 1
+                headlines = get_news_for_stock(symbol, df.index[i])  # Pass date for contextual news
+                sentiment_score = get_sentiment_score(headlines)
             except Exception as e:
                 print(f"Sentiment failed for {symbol}: {e}")
-                sentiment_score = 0  # Neutral fallback
-            adjusted_strength = tech_strength * (1 + 0.5 * sentiment_score)  # boost/reduce by up to ±50%
+                sentiment_score = 0
+
+            adjusted_strength = tech_strength * (1 + 0.5 * sentiment_score)
             adjusted_strength = np.clip(adjusted_strength, -1.0, 1.0)
             df.at[df.index[i], "Signal_Strength"] = round(adjusted_strength, 2)
         else:
-            sentiment_score = 0
-            print(df)
-            adjusted_strength = np.clip(sentiment_score, -1.0, 1.0)
-            
-            df.loc[df.index[i], "Signal_Strength"] = tech_strength
+            df.at[df.index[i], "Signal_Strength"] = tech_strength
         # Integrate sentiment
     return df
 
@@ -626,12 +671,14 @@ def main():
             df = detect_market_trend(df)
             # df = calculate_stop_loss(df)
             df = signal_calculate(df, symbol)
+            
             df = signal_strength(df,symbol)
+
             # df = signal_strength(df,symbol,mode="real")
             df = backtest_strategy(df)
             # print(df[['Close', 'BB_High', 'BB_Low', 'BB_Middle', 'MACD', 'MACD_Signal', 'MACD_Hist', 'MA100', 'Stoch_%K', 'Stoch_%D', 'OBV','Signal','Portfolio']].tail())
             # Place Order Based on the Last Signal
-            latest_signal = df.iloc[-1]["Signal"]
+            # latest_signal = df.iloc[-1]["Signal"]
             qty = 10  # You can adjust quantity based on strategy or capital
             # Set your risk management
             stop_loss_pct = 0.5  # 50% Stop Loss
@@ -650,6 +697,9 @@ def main():
             print(f"Sharpe Ratio: {sharpe_ratio:.2f}, Max Drawdown: {max_drawdown:.2%}")
             balance.append({"symbol": symbol, "balance": df[["Portfolio"]].tail()})
             print(df[["Signal", "Signal_Strength", "Portfolio"]].tail(10))
+            df_export = df[["Open", "High", "Low", "Close", "Volume", "Signal_Strength", "SuperTrend", "Market_Trend","Signal",'Date']].copy()
+            df_export.reset_index(inplace=True)  # bring Date back as a column
+            df_export.to_csv(f"stock_{symbol}.csv", index=False)
         except Exception as e:
             print(f"Error processing symbol {symbol}: {e}")
     print("--" * 30)
