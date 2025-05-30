@@ -11,3 +11,4 @@ torchvision
 torchaudio
 backtrader
 notebook
+scipy
