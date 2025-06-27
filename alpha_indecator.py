@@ -8,7 +8,8 @@
 # sys.modules['urllib3.packages.six.moves'] = six.moves
 # sys.modules['urllib3.packages.six'] = urllib3_six
 
-
+# Trend Detection and Stock Analysis Module
+# Large-cap, blue chip, sector/industry ETFs, commodities, indices—assets with a history of long, smooth trends.
 
 
 
